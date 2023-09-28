@@ -170,8 +170,6 @@ import subprocess
 import sys
 import syslog
 import time
-# dns.resolver requires installing DNSPython (see install instructions)
-import dns.resolver
 
 # Global configuration settings
 # logStr is a formatting pattern used by str.format() to align outputs
@@ -220,6 +218,11 @@ def parseArgs():
     parser.add_argument('-D', '--dampening', type=int, default=3,
                         help='Dampening amount of fail/success for target to\
                                 be considered switching status')
+
+    parser.add_argument('-M', '--minalive', type=int, default=0,
+                        help='When specifying multiple hosts to check, how many must be\
+                                alive for the check to be considered successful.  \
+                                Default=0 means all hosts')
 
     parser.add_argument('host', nargs='+',
                         help='FQDN or IP address of the destination(s) to \
@@ -294,25 +297,39 @@ def checkSocket(ip, port, timeout):
 '''
 
 
-class CheckDNS:
+class checkDNS:
     # Verify that a host resolves via a specified DNS server, returns the IP
     def __init__(self, dnsServer, source, target):
         self.dnsServer = dnsServer
         self.source = source
         self.target = target
 
+
     def isAlive(self):
-        results = self.resolve()
-        ip = ''
-        if results:
-            # There might be multiple IP address but the 1st suffice
-            ip = results[0]
-            result = True
-        else:
-            result = False
+        results = []
+        for host in self.target:
+            result = self.resolve()
+            ip = ''
+            if result:
+                # There might be multiple IP address but the 1st suffice
+                ip = result[0]
+                results.append((True, ip))
+            else:
+                results.append((False, ''))
+
+                
+        result = sum(bool(x[0]) for x in results) >= args.minalive
+        ip = results[0][1]
+
         return result, ip
 
     def resolve(self):
+        try:
+            import dns.resolver
+        except:
+            print("please install the python dns resolver per the instructions")
+            sys.exit()
+
         queryType = 'A'
         results = ''
         resolver = dns.resolver.Resolver(configure=False)
@@ -354,7 +371,7 @@ class checkICMP:
         timingData = lastNonEmpty.split('=')[1]
         timingStats = timingData.split('/')
         pingAvg = timingStats[1]
-        return pingAvg + ' ms'
+        return float(pingAvg) # + ' ms'
 
     def isAlive(self):
         result = ''
@@ -363,48 +380,51 @@ class checkICMP:
         pythonVersion = sys.version_info[0]
         logging.debug(logStr.format('Python version:', pythonVersion))
 
+        results   = []
+
         src_exists = True if args.source else False
-        command = ['ping'] + \
-                  ['-n'] + \
-                  ['-c 1'] + \
-                  ['-W ' + str(args.timeout * self.timeUnit)] + \
-                  [self.sourceSetting + str(args.source)] * src_exists + \
-                  [self.host]
-        logging.debug(logStr.format('The command is:', str(command)))
+        for host in self.host:
+            command = ['ping'] + \
+                    ['-n'] + \
+                    ['-c 1'] + \
+                    ['-W ' + str(args.timeout * self.timeUnit)] + \
+                    [self.sourceSetting + str(args.source)] * src_exists + \
+                    [host]
+            logging.debug(logStr.format('The command is:', str(command)))
 
-        # Python 2 compatibility for running on EOS
-        if sys.version_info[0] < 3:
-            proc = subprocess.Popen(command,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE)
-            returncode = proc.wait()
-            if returncode == 0:
-                rawOutput = proc.communicate()
-                output = rawOutput[0].decode('ascii')
-                result = True
-            else:
-                error = 'The ICMP check did not succeed'
-                logging.info(error)
-                result = False
-
-        # Python 3
-        if sys.version_info[0] >= 3:
-            proc = subprocess.run(command, capture_output=True)
-            if proc.returncode == 0:
-                output = proc.stdout.decode('ascii')
-                result = True
-            else:
-                # If proc.returncode != 0 it means an error occured.
-                # We get a clean line for the error message
-                error = proc.stderr.decode('ascii').split('\n')[0]
-                if error == '':
+            # Python 2 compatibility for running on EOS
+            if sys.version_info[0] < 3:
+                proc = subprocess.Popen(command,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+                returncode = proc.wait()
+                if returncode == 0:
+                    rawOutput = proc.communicate()
+                    results.append((True, self.getLatency(rawOutput[0].decode('ascii'))))
+                else:
                     error = 'The ICMP check did not succeed'
-                logging.info(error)
-                result = False
+                    logging.info(error)
+                    results.append((False, 0))
+
+            # Python 3
+            if sys.version_info[0] >= 3:
+                proc = subprocess.run(command, capture_output=True)
+                if proc.returncode == 0:
+                    results.append((True, self.getLatency(proc.stdout.decode('ascii'))))
+                else:
+                    # If proc.returncode != 0 it means an error occured.
+                    # We get a clean line for the error message
+                    error = proc.stderr.decode('ascii').split('\n')[0]
+                    if error == '':
+                        error = 'The ICMP check did not succeed'
+                    logging.info(error)
+                    results.append((False, 0))
         
-        if output:
+        result = sum(bool(x[0]) for x in results) >= args.minalive
+        if result:
+            latency = sum(x[1] for x in results)/len(results)
             logging.debug(logStr.format('The output is:', output))
-            latency = self.getLatency(output)
+
         return result, latency
 
 
@@ -434,12 +454,16 @@ def main():
     argsDisplay(args)
     osSettings = checkOS()
 
+    if args.minalive == 0:
+        args.minalive = len(args.host)
+
+
     try:
         while True:
             if args.mode == 'icmp':
-                check = checkICMP(osSettings, args.host[0])
+                check = checkICMP(osSettings, args.host)
             if args.mode == 'dns':
-                check = CheckDNS(args.dns, args.source, args.host[0])
+                check = checkDNS(args.dns, args.source, args.host)
             
             # Check alive (True/False) and response (ICMP latency or DNS IP@)
             alive, response = check.isAlive()
@@ -463,8 +487,9 @@ def main():
                         wasAlive = True
                         dampeningAlive = 0
                         logging.error('Target resurrected!')
-                        send.syslog('Target {} is back to life - {} check'.format(
-                                    args.host[0], args.mode))
+                        #send.syslog('Target {} is back to life - {} check'.format(
+                                    #args.host[0], args.mode))
+                        send.syslog('firewall is back')
                 
             else:
                 # Looks like dead. Dampening in progress
@@ -474,8 +499,9 @@ def main():
 
                 if wasAlive and (dampeningDead >= args.dampening):
                     logging.error(logStr.format('Warning:', 'Target is dead'))
-                    send.syslog('Target {} is dead - {} check'.format(
-                                args.host[0], args.mode))
+                    #send.syslog('Target {} is dead - {} check'.format(
+                                #args.host[0], args.mode))
+                    send.syslog('firewall is broken')
                     # Death tracker
                     wasAlive = False
                 else:
