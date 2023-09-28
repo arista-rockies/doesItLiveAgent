@@ -454,9 +454,8 @@ def main():
     argsDisplay(args)
     osSettings = checkOS()
 
-    if args.minalive == 0:
+    if args.minalive == 0 or args.minalive > len(args.host):
         args.minalive = len(args.host)
-
 
     try:
         while True:
